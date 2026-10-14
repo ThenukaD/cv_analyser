@@ -63,39 +63,32 @@ def extract_experience(text: str) -> int:
 # RULE-BASED CV ANALYSIS (IMPROVED)
 # ─────────────────────────────────────────────
 
-def analyze_cv(text: str, job_keywords: dict = None, min_exp: int = 0, max_exp: int = 99, job_type: str = "professional") -> dict:
+def analyze_cv(text: str, job_keywords: dict = None, min_exp: int = 0, max_exp: int = 99, job_type: str = "professional", reject_below: float = 0) -> dict:
     """
     Analyze CV text using keyword matching and return a priority score.
 
     Args:
         text: Raw CV text.
         job_keywords: Dict of {keyword: weight}. Falls back to defaults if None.
-        min_exp: Minimum years of experience required (ignored for internship).
-        max_exp: Maximum years of experience allowed (ignored for internship).
+        min_exp: Preferred minimum years of experience for reference only.
+        max_exp: Preferred maximum years of experience for reference only.
         job_type: "professional" or "internship".
+        reject_below: Reject the CV if its weighted keyword match % is below this (0 disables).
 
     Returns:
-        Dict with score, matched_keywords, experience_years, and summary.
+        Dict with score, match_pct, rejected, matched_keywords, experience_years, and summary.
     """
     experience_years = extract_experience(text)
     lower_text = text.lower()
 
-    # Experience gate — only applied for professional roles
+    # Experience range is informational only for professional roles.
+    # It should not reject a CV from shortlisting.
+    experience_note = "Experience within preferred range"
     if job_type == "professional":
-        if experience_years > max_exp and max_exp < 99:
-            return {
-                "score": 0,
-                "matched_keywords": [],
-                "experience_years": experience_years,
-                "summary": f"❌ Rejected: {experience_years} years of experience (max allowed: {max_exp})"
-            }
-        if experience_years < min_exp and experience_years > 0:
-            return {
-                "score": 0,
-                "matched_keywords": [],
-                "experience_years": experience_years,
-                "summary": f"❌ Rejected: Only {experience_years} years of experience (min required: {min_exp})"
-            }
+        if max_exp < 99 and experience_years > max_exp:
+            experience_note = f"Experience {experience_years} yrs exceeds preferred max {max_exp}"
+        elif min_exp > 0 and experience_years > 0 and experience_years < min_exp:
+            experience_note = f"Experience {experience_years} yrs is below preferred min {min_exp}"
 
     # No hardcoded defaults — keywords must be supplied by the caller via the UI
     if not job_keywords:
@@ -112,6 +105,12 @@ def analyze_cv(text: str, job_keywords: dict = None, min_exp: int = 0, max_exp: 
         if re.search(pattern, lower_text):
             score += weight
             found_keywords.append(keyword)
+
+    # Weighted keyword match as a percentage of the total possible keyword weight.
+    # Bonuses below are excluded so the threshold reflects skill match only.
+    total_weight = sum(job_keywords.values())
+    match_pct = round(score / total_weight * 100, 1) if total_weight else None
+    rejected = match_pct is not None and match_pct < reject_below
 
     if job_type == "professional":
         # Bonus: seniority signals (not relevant for internships)
@@ -130,13 +129,23 @@ def analyze_cv(text: str, job_keywords: dict = None, min_exp: int = 0, max_exp: 
         score += min(internship_bonus, 10)
 
     exp_label = f"{experience_years} yrs" if experience_years > 0 else "Not specified"
+    if job_type == "professional":
+        range_text = f"Preferred range: {min_exp}-{max_exp} yrs | {experience_note}"
+    else:
+        range_text = "Experience filter disabled for internship mode"
+
+    match_text = f"Keyword match: {match_pct}%" if match_pct is not None else "Keyword match: N/A"
+
     return {
         "score": score,
+        "match_pct": match_pct,
+        "rejected": rejected,
         "matched_keywords": found_keywords,
         "experience_years": experience_years,
         "summary": (
+            f"{f'❌ Rejected (match {match_pct}% < {reject_below}%) | ' if rejected else ''}"
             f"{'🎓 Internship mode | ' if job_type == 'internship' else ''}"
-            f"Experience: {exp_label} | "
+            f"{match_text} | Experience: {exp_label} | {range_text} | "
             f"Matched {len(found_keywords)} skills: {', '.join(found_keywords) or 'None'}"
         )
     }
@@ -439,6 +448,45 @@ def analyze_cv_with_ollama(
         )
     except Exception as e:
         return _error_response(f"Ollama analysis failed: {e}")
+
+
+# ─────────────────────────────────────────────
+# CLAUDE-POWERED CV ANALYSIS
+# ─────────────────────────────────────────────
+
+def analyze_cv_with_claude(
+    cv_text: str,
+    job_description: str,
+    api_key: str,
+    model: str = "claude-opus-4-7",
+    job_type: str = "professional"
+) -> dict:
+    """
+    Use Claude (Anthropic) to evaluate a CV against a job description.
+    Requires: pip install anthropic
+    """
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=api_key)
+        system_prompt = SYSTEM_PROMPT_INTERNSHIP if job_type == "internship" else SYSTEM_PROMPT_PROFESSIONAL
+
+        response = client.messages.create(
+            model=model,
+            max_tokens=1024,
+            system=[{
+                "type": "text",
+                "text": system_prompt,
+                "cache_control": {"type": "ephemeral"},
+            }],
+            messages=[{
+                "role": "user",
+                "content": _build_user_prompt(cv_text, job_description, job_type),
+            }],
+        )
+        raw = response.content[0].text.strip()
+        return _parse_ai_response(raw)
+    except Exception as e:
+        return _error_response(f"Claude analysis failed: {e}")
 
 
 def list_ollama_models(ollama_url: str = "http://localhost:11434") -> list[str]:

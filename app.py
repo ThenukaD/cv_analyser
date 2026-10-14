@@ -6,6 +6,7 @@ from shortlist import (
     extract_text, analyze_cv,
     analyze_cv_with_openai,
     analyze_cv_with_ollama,
+    analyze_cv_with_claude,
     list_ollama_models
 )
 
@@ -45,11 +46,12 @@ with st.sidebar:
     st.subheader("Analysis Mode")
     mode = st.radio(
         "Select mode",
-        options=["keyword", "ollama", "openai"],
+        options=["keyword", "claude", "ollama", "openai"],
         format_func=lambda x: {
             "keyword": "🔍 Keyword Scoring",
+            "claude":  "🤖 Claude (Anthropic API)",
             "ollama":  "🦙 Ollama (Local, Free)",
-            "openai":  "🤖 OpenAI (API Key required)",
+            "openai":  "🔵 OpenAI (API Key required)",
         }[x],
         index=0,
     )
@@ -74,9 +76,9 @@ with st.sidebar:
     if job_type == "professional":
         st.subheader("Experience Filter")
         exp_min, exp_max = st.slider(
-            "Acceptable years of experience",
+            "Preferred years of experience (reference only)",
             min_value=0, max_value=30, value=(0, 15),
-            help="CVs outside this range will be automatically rejected."
+            help="This is logged for reference only and does not reject CVs from shortlisting."
         )
     else:
         exp_min, exp_max = 0, 99   # effectively disabled
@@ -144,6 +146,18 @@ with st.sidebar:
 
     st.divider()
 
+    # --- Rejection Threshold ---
+    st.subheader("🚫 Rejection Threshold")
+    reject_below = st.number_input(
+        "Reject CVs with weighted keyword match below (%)",
+        min_value=0, max_value=100, value=60, step=5,
+        help="Match % = sum of matched keyword weights ÷ sum of all keyword weights × 100. "
+             "Set to 0 to disable rejection. In AI modes, rejected CVs are not sent to the AI."
+    )
+    hide_rejected = st.checkbox("Hide rejected CVs from results", value=False)
+
+    st.divider()
+
     # --- Ollama Config ---
     if mode == "ollama":
         st.subheader("🦙 Ollama Settings")
@@ -189,6 +203,23 @@ ollama serve
 **Step 4 — Come back here and upload CVs!**
 No API key needed. Runs 100% on your machine.
 """)
+
+    # --- Claude Config ---
+    if mode == "claude":
+        st.subheader("🤖 Claude Settings")
+        claude_key = st.text_input(
+            "Anthropic API Key",
+            type="password",
+            placeholder="sk-ant-...",
+            help="Your key is only used for this session and never stored."
+        )
+        claude_model = st.selectbox(
+            "Model",
+            options=["claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5"],
+            index=0,
+            help="Opus 4.7 is most capable. Sonnet 4.6 balances speed and quality. Haiku 4.5 is fastest."
+        )
+        st.caption("💡 **Tip:** Haiku 4.5 costs ~$0.001 per CV. Opus 4.7 gives the deepest insights.")
 
     # --- OpenAI Config ---
     if mode == "openai":
@@ -236,10 +267,13 @@ analyse_btn = st.button("▶ Analyse CVs", type="primary", disabled=not uploaded
 # PROCESSING
 # ─────────────────────────────────────────────
 if analyse_btn and uploaded_files:
+    if mode == "claude" and not claude_key:
+        st.error("Please enter your Anthropic API key in the sidebar.")
+        st.stop()
     if mode == "openai" and not openai_key:
         st.error("Please enter your OpenAI API key in the sidebar.")
         st.stop()
-    if mode in ("openai", "ollama") and not job_description.strip():
+    if mode in ("claude", "openai", "ollama") and not job_description.strip():
         st.warning("⚠️ No job description provided. AI analysis will be less accurate.")
 
     results = []
@@ -261,10 +295,13 @@ if analyse_btn and uploaded_files:
                 min_exp=exp_min,
                 max_exp=exp_max,
                 job_type=job_type,
+                reject_below=reject_below,
             )
             results.append({
                 "filename": uploaded_file.name,
                 "score": analysis["score"],
+                "match_pct": analysis["match_pct"],
+                "rejected": analysis["rejected"],
                 "experience_years": analysis["experience_years"],
                 "matched_keywords": analysis["matched_keywords"],
                 "summary": analysis["summary"],
@@ -272,27 +309,32 @@ if analyse_btn and uploaded_files:
                 "job_type": job_type,
             })
 
-        else:  # ollama or openai
-            kw_analysis = analyze_cv(cv_text, job_keywords=job_keywords, min_exp=exp_min, max_exp=exp_max, job_type=job_type)
-            if kw_analysis["score"] == 0 and "Rejected" in kw_analysis["summary"]:
+        else:  # claude, ollama or openai
+            kw_analysis = analyze_cv(cv_text, job_keywords=job_keywords, min_exp=exp_min, max_exp=exp_max, job_type=job_type, reject_below=reject_below)
+            if kw_analysis["rejected"]:
+                # Skip the AI call for CVs below the keyword threshold
                 results.append({
                     "filename": uploaded_file.name,
                     "score": 0,
+                    "match_pct": kw_analysis["match_pct"],
+                    "rejected": True,
                     "experience_years": kw_analysis["experience_years"],
-                    "matched_keywords": [],
+                    "matched_keywords": kw_analysis["matched_keywords"],
                     "summary": kw_analysis["summary"],
                     "ai_score": 0,
                     "strengths": [],
                     "gaps": [],
                     "experience_fit": "Rejected",
                     "recommendation": "No",
-                    "ai_summary": kw_analysis["summary"],
+                    "ai_summary": "AI analysis skipped — CV rejected by keyword match threshold.",
                     "mode": mode,
                     "job_type": job_type,
                 })
             else:
                 jd = job_description.strip() or ("Internship role." if job_type == "internship" else "General software engineering role.")
-                if mode == "ollama":
+                if mode == "claude":
+                    ai = analyze_cv_with_claude(cv_text, jd, api_key=claude_key, model=claude_model, job_type=job_type)
+                elif mode == "ollama":
                     ai = analyze_cv_with_ollama(cv_text, jd, model=ollama_model, ollama_url=ollama_url, job_type=job_type)
                 else:
                     ai = analyze_cv_with_openai(cv_text, jd, api_key=openai_key, model=openai_model, job_type=job_type)
@@ -300,6 +342,8 @@ if analyse_btn and uploaded_files:
                 results.append({
                     "filename": uploaded_file.name,
                     "score": ai["ai_score"],
+                    "match_pct": kw_analysis["match_pct"],
+                    "rejected": False,
                     "experience_years": kw_analysis["experience_years"],
                     "matched_keywords": kw_analysis["matched_keywords"],
                     "summary": kw_analysis["summary"],
@@ -314,7 +358,8 @@ if analyse_btn and uploaded_files:
                 })
 
     progress.progress(1.0, text="✅ Done!")
-    st.session_state.results = sorted(results, key=lambda x: x["score"], reverse=True)
+    # Shortlisted CVs first, then by score
+    st.session_state.results = sorted(results, key=lambda x: (not x["rejected"], x["score"]), reverse=True)
 
 
 # ─────────────────────────────────────────────
@@ -324,10 +369,27 @@ if st.session_state.results:
     st.divider()
     st.subheader("📊 Ranked Results")
 
-    results = st.session_state.results
+    all_results = st.session_state.results
+    rejected_count = sum(1 for r in all_results if r.get("rejected"))
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total CVs", len(all_results))
+    c2.metric("✅ Shortlisted", len(all_results) - rejected_count)
+    c3.metric("❌ Rejected", rejected_count)
+
+    results = [r for r in all_results if not r.get("rejected")] if hide_rejected else all_results
+    if not results:
+        st.info("All CVs were rejected by the keyword match threshold. Untick 'Hide rejected CVs' to see them.")
+        st.stop()
+
+    def fmt_pct(r):
+        return f"{r['match_pct']}%" if r.get("match_pct") is not None else "—"
+
+    def status(r):
+        return "❌ Rejected" if r.get("rejected") else "✅ Shortlisted"
+
     result_mode = results[0].get("mode", "keyword")
     result_job_type = results[0].get("job_type", "professional")
-    is_ai_mode = result_mode in ("openai", "ollama")
+    is_ai_mode = result_mode in ("claude", "openai", "ollama")
     exp_fit_label = "Candidate Level" if result_job_type == "internship" else "Exp Fit"
 
     if result_job_type == "internship":
@@ -339,8 +401,10 @@ if st.session_state.results:
         for rank, r in enumerate(results, 1):
             table_data.append({
                 "Rank": rank,
+                "Status": status(r),
                 "Filename": r["filename"],
                 "Score": r["score"],
+                "Match %": fmt_pct(r),
                 "Exp (yrs)": r["experience_years"],
                 "Matched Keywords": ", ".join(r["matched_keywords"]) or "—",
                 "Summary": r["summary"],
@@ -361,8 +425,10 @@ if st.session_state.results:
             reco = r.get("recommendation", "—")
             table_data.append({
                 "Rank": rank,
+                "Status": status(r),
                 "Filename": r["filename"],
                 "AI Score": r.get("ai_score", "—"),
+                "Match %": fmt_pct(r),
                 "Exp (yrs)": r["experience_years"],
                 exp_fit_label: r.get("experience_fit", "—"),
                 "Recommendation": f"{RECO_COLORS.get(reco, '')} {reco}",
@@ -373,11 +439,12 @@ if st.session_state.results:
     # ── Expandable detail cards ──
     st.subheader("🗂️ Detailed Candidate Cards")
     for rank, r in enumerate(results, 1):
-        label = f"#{rank} — {r['filename']}  |  Score: {r['score']}"
+        label = f"#{rank} — {r['filename']}  |  Score: {r['score']}  |  Match: {fmt_pct(r)}  |  {status(r)}"
         with st.expander(label, expanded=(rank == 1)):
             col1, col2 = st.columns(2)
             with col1:
                 st.metric("Score", r["score"])
+                st.metric("Keyword Match", fmt_pct(r))
                 st.metric("Experience", f"{r['experience_years']} yrs")
                 if r.get("matched_keywords"):
                     st.markdown("**Matched Keywords:**")
@@ -417,8 +484,10 @@ if st.session_state.results:
         for rank, r in enumerate(results, 1):
             export_rows.append({
                 "Rank": rank,
+                "Status": "Rejected" if r.get("rejected") else "Shortlisted",
                 "Filename": r["filename"],
                 "AI Score": r.get("ai_score", ""),
+                "Match %": r.get("match_pct", ""),
                 "Exp (yrs)": r["experience_years"],
                 "Exp Fit": r.get("experience_fit", ""),
                 "Recommendation": r.get("recommendation", ""),
@@ -431,8 +500,10 @@ if st.session_state.results:
         for rank, r in enumerate(results, 1):
             export_rows.append({
                 "Rank": rank,
+                "Status": "Rejected" if r.get("rejected") else "Shortlisted",
                 "Filename": r["filename"],
                 "Score": r["score"],
+                "Match %": r.get("match_pct", ""),
                 "Exp (yrs)": r["experience_years"],
                 "Matched Keywords": ", ".join(r["matched_keywords"]),
                 "Summary": r["summary"],
